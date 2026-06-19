@@ -8,6 +8,8 @@ import urllib.request
 import urllib.error
 from html.parser import HTMLParser
 
+import scorer as sc
+
 app = Flask(__name__)
 CORS(app)
 
@@ -17,32 +19,23 @@ client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 # Prompts
 # ---------------------------------------------------------------------------
 
-ANALYSIS_PROMPT = """You are an API documentation quality analyzer using the Hermes rubric. Analyze the given OpenAPI spec and return ONLY a valid JSON object (no markdown, no preamble).
+# Claude is only asked for semantic quality - mechanical checks happen in Python.
+# semanticScore: 0-20 per endpoint (are descriptions clear, accurate, non-bloated?)
+SEMANTIC_PROMPT = """You are an API documentation quality reviewer. For each endpoint below, assess the SEMANTIC quality of its human-written text only (summaries, descriptions, response descriptions). You are NOT checking structural completeness - that is handled separately.
 
-The JSON must have this exact structure:
+Return ONLY a valid JSON object (no markdown, no preamble):
 {{
-  "overallScore": <integer 0-100>,
-  "summary": "<2 sentence assessment>",
-  "totalSmells": <integer>,
-  "smells": {{
-    "lazy": <count>,
-    "bloated": <count>,
-    "tangled": <count>,
-    "fragmented": <count>,
-    "response": <count>,
-    "security": <count>,
-    "input": <count>
-  }},
   "endpoints": [
     {{
-      "method": "<GET|POST|PUT|DELETE|PATCH>",
-      "path": "<path string>",
-      "score": <integer 0-100>,
-      "smells": ["lazy"|"bloated"|"tangled"|"fragmented"|"response"|"security"|"input"],
-      "analysis": "<1-2 sentence diagnosis>",
-      "fixes": ["<concrete fix 1>", "<concrete fix 2>"]
+      "method": "<method>",
+      "path": "<path>",
+      "semanticScore": <integer 0-20>,
+      "smells": ["lazy"|"bloated"|"tangled"|"fragmented"],
+      "analysis": "<1-2 sentence diagnosis of text quality>",
+      "fixes": ["<concrete text improvement 1>", "<concrete text improvement 2>"]
     }}
   ],
+  "summary": "<2 sentence overall assessment of documentation prose quality>",
   "recommendations": [
     {{
       "title": "<short action title>",
@@ -51,20 +44,20 @@ The JSON must have this exact structure:
   ]
 }}
 
-Score definitions:
-- LAZY: vague/short summaries, undocumented parameters, generic response messages
-- BLOATED: verbose descriptions with little informational value, padded text
-- TANGLED: mixes unrelated concerns in one description
-- FRAGMENTED: essential info scattered without linkage
-- RESPONSE: missing error codes, no error schemas, missing examples, no 4xx/5xx docs
-- SECURITY: no auth schemes defined, missing scopes, over-permissioned endpoints
-- INPUT: undescribed request body properties, missing constraints
+Semantic score guide (0-20):
+- 17-20: Descriptions are clear, specific, accurate, and useful to an agent
+- 12-16: Mostly clear with minor vagueness or filler
+- 7-11:  Vague, generic, or partially misleading descriptions
+- 0-6:   Missing, copied boilerplate, or actively incorrect
 
-Overall score: 100 minus penalty points. Each smell = -3 to -8 points depending on severity.
-Provide all endpoints (max 10) and 3-5 prioritized recommendations.
+Smell tags (semantic only - do not tag structural issues):
+- lazy: summary/description is vague, trivially short, or says nothing useful
+- bloated: verbose padding with little informational value
+- tangled: mixes unrelated concerns in one description
+- fragmented: description references info that is not present or linked
 
-OpenAPI spec to analyze:
-{spec}"""
+Endpoints to assess:
+{endpoints}"""
 
 PROSE_EXTRACT_PROMPT = """You are reading API documentation written as unstructured prose (from a PDF, web page, Confluence page, etc.). Extract a structured representation of the API from this text.
 
@@ -97,34 +90,21 @@ If you cannot find clear endpoint information, do your best with what is availab
 Prose documentation to parse:
 {text}"""
 
-PROSE_ANALYSIS_PROMPT = """You are an API documentation quality analyzer using the Hermes rubric. You are analyzing documentation that was written as unstructured prose (not a clean OpenAPI spec), so apply additional scrutiny for discoverability and agent-readiness.
+PROSE_SEMANTIC_PROMPT = """You are an API documentation quality reviewer assessing prose API documentation (not a formal OpenAPI spec). Evaluate the semantic quality of the extracted endpoint descriptions.
 
-Given this structured extraction from prose API documentation, return ONLY a valid JSON object (no markdown, no preamble).
-
-The JSON must have this exact structure:
+Return ONLY a valid JSON object (no markdown, no preamble):
 {{
-  "overallScore": <integer 0-100>,
-  "summary": "<2 sentence assessment — mention that this was scored from prose docs, not a formal spec>",
-  "totalSmells": <integer>,
-  "smells": {{
-    "lazy": <count>,
-    "bloated": <count>,
-    "tangled": <count>,
-    "fragmented": <count>,
-    "response": <count>,
-    "security": <count>,
-    "input": <count>
-  }},
   "endpoints": [
     {{
-      "method": "<GET|POST|PUT|DELETE|PATCH|UNKNOWN>",
-      "path": "<path string>",
-      "score": <integer 0-100>,
-      "smells": ["lazy"|"bloated"|"tangled"|"fragmented"|"response"|"security"|"input"],
+      "method": "<method>",
+      "path": "<path>",
+      "semanticScore": <integer 0-20>,
+      "smells": ["lazy"|"bloated"|"tangled"|"fragmented"],
       "analysis": "<1-2 sentence diagnosis>",
-      "fixes": ["<concrete fix 1>", "<concrete fix 2>"]
+      "fixes": ["<concrete improvement 1>", "<concrete improvement 2>"]
     }}
   ],
+  "summary": "<2 sentence assessment - note this was scored from prose docs, not a formal spec>",
   "recommendations": [
     {{
       "title": "<short action title>",
@@ -133,26 +113,16 @@ The JSON must have this exact structure:
   ]
 }}
 
-Score definitions:
-- LAZY: vague descriptions, undocumented parameters, generic response info
-- BLOATED: verbose text with little informational value
-- TANGLED: mixes unrelated concerns
-- FRAGMENTED: essential info scattered, no cross-linking
-- RESPONSE: missing error codes, no error descriptions, no examples
-- SECURITY: auth mechanism unclear or undocumented, missing scope info
-- INPUT: undescribed request fields, missing constraints or types
+Semantic score guide (0-20):
+- 17-20: Clear, specific, accurate descriptions useful to an agent
+- 12-16: Mostly clear with minor vagueness
+- 7-11:  Vague, generic, or incomplete
+- 0-6:   Missing, boilerplate, or actively misleading
 
-Additional prose-doc penalties:
-- No machine-readable spec exists at all: -10 points
-- Endpoints not clearly enumerated (hard to discover): -8 points
-- Auth mechanism not explained: -8 points
-- No base URL stated: -5 points
-- Each endpoint missing examples: -3 points each
+Always include a recommendation to publish a formal OpenAPI spec.
 
-Provide all endpoints (max 10) and 4-5 prioritized recommendations. Include a recommendation to publish a formal OpenAPI spec if one is absent.
-
-Extracted API structure:
-{extracted}
+Extracted endpoints:
+{endpoints}
 
 Missing info identified during extraction:
 {missing_info}"""
@@ -224,7 +194,108 @@ def _scrape_url(url):
     parser = _TextExtractor()
     parser.feed(html)
     text = parser.get_text()
-    return text[:20000]  # cap to avoid huge context
+    return text[:20000]
+
+
+# ---------------------------------------------------------------------------
+# Hybrid scoring helpers
+# ---------------------------------------------------------------------------
+
+def _call_claude(prompt: str, max_tokens: int = 2000) -> dict:
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = "".join(b.text for b in message.content if hasattr(b, "text"))
+    clean = raw.replace("```json", "").replace("```", "").strip()
+    return json.loads(clean)
+
+
+def _build_hybrid_result(spec_dict: dict, semantic: dict) -> dict:
+    """
+    Combine mechanical scores from scorer.py with Claude's semantic scores.
+    Returns the full result dict ready for the frontend.
+    """
+    operations = sc.extract_operations(spec_dict)
+    ops_for_semantic = operations[:20]
+
+    global_info = sc.compute_global_penalties(spec_dict)
+
+    semantic_map = {
+        (e["method"].upper(), e["path"]): e
+        for e in semantic.get("endpoints", [])
+    }
+
+    endpoints_out = []
+    endpoint_totals = []
+
+    for method, path, operation in ops_for_semantic:
+        mech = sc.score_endpoint(operation, method, spec_dict)
+        sem = semantic_map.get((method, path), {})
+
+        semantic_score = max(0, min(20, sem.get("semanticScore", 10)))
+        total = min(100, mech["mechanicalScore"] + semantic_score)
+        endpoint_totals.append(total)
+
+        all_smells = list(set(mech["smells"]) | set(sem.get("smells", [])))
+
+        endpoints_out.append({
+            "method": method,
+            "path": path,
+            "score": total,
+            "smells": all_smells,
+            "analysis": sem.get("analysis", ""),
+            "fixes": sem.get("fixes", []),
+            "scoreBreakdown": {
+                "mechanical": mech["mechanicalScore"],
+                "semantic": semantic_score,
+                "deductions": mech["deductions"],
+            },
+        })
+
+    overall = sc.compute_overall_score(endpoint_totals, global_info["totalPenalty"])
+    smells_agg = sc.aggregate_smells(endpoints_out)
+    total_smells = sum(smells_agg.values())
+
+    return {
+        "overallScore": overall,
+        "summary": semantic.get("summary", ""),
+        "totalSmells": total_smells,
+        "smells": smells_agg,
+        "endpoints": endpoints_out,
+        "recommendations": semantic.get("recommendations", []),
+        "scoreBreakdown": {
+            "globalPenalties": global_info["adjustments"],
+            "endpointAverage": round(sum(endpoint_totals) / len(endpoint_totals)) if endpoint_totals else 0,
+        },
+    }
+
+
+def _prose_mechanical_penalties(extracted: dict) -> tuple[int, list[dict]]:
+    """Deterministic penalties for prose docs based on extracted structure fields."""
+    total = 0
+    adjustments = []
+
+    def penalize(reason: str, points: int, smell: str):
+        nonlocal total
+        total += points
+        adjustments.append({"reason": reason, "penalty": points, "smell": smell})
+
+    penalize("no_machine_readable_spec", 10, "fragmented")
+
+    if not extracted.get("base_url"):
+        penalize("no_base_url", 5, "lazy")
+
+    if not extracted.get("auth_mechanism"):
+        penalize("no_auth_mechanism", 8, "security")
+
+    endpoints = extracted.get("endpoints", [])
+    missing_examples = sum(1 for e in endpoints if not e.get("examples_present", False))
+    if missing_examples:
+        penalize("endpoints_missing_examples", min(missing_examples * 3, 15), "response")
+
+    return total, adjustments
 
 
 # ---------------------------------------------------------------------------
@@ -234,22 +305,28 @@ def _scrape_url(url):
 @app.route("/api/analyze", methods=["POST"])
 def analyze():
     data = request.get_json()
-    spec = data.get("spec", "").strip()
-    if not spec:
+    spec_text = data.get("spec", "").strip()
+    if not spec_text:
         return jsonify({"error": "No spec provided"}), 400
 
     try:
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": ANALYSIS_PROMPT.format(spec=spec)}]
+        spec_dict = sc.parse_spec(spec_text)
+    except Exception:
+        return jsonify({"error": "Could not parse spec as JSON or YAML"}), 400
+
+    operations = sc.extract_operations(spec_dict)
+    if not operations:
+        return jsonify({"error": "No endpoints found in spec"}), 400
+
+    try:
+        semantic_input = sc.build_semantic_input(operations[:20])
+        semantic = _call_claude(
+            SEMANTIC_PROMPT.format(endpoints=json.dumps(semantic_input, indent=2))
         )
-        raw = "".join(b.text for b in message.content if hasattr(b, "text"))
-        clean = raw.replace("```json", "").replace("```", "").strip()
-        result = json.loads(clean)
+        result = _build_hybrid_result(spec_dict, semantic)
         return jsonify(result)
     except json.JSONDecodeError as e:
-        return jsonify({"error": f"Failed to parse analysis: {str(e)}"}), 500
+        return jsonify({"error": f"Failed to parse Claude response: {str(e)}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -263,35 +340,81 @@ def analyze_prose():
         return jsonify({"error": "No text provided"}), 400
 
     try:
-        # Step 1: extract structured API info from prose
-        extract_msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
+        extracted = _call_claude(
+            PROSE_EXTRACT_PROMPT.format(text=text[:15000]),
             max_tokens=2000,
-            messages=[{"role": "user", "content": PROSE_EXTRACT_PROMPT.format(text=text[:15000])}]
         )
-        raw_extract = "".join(b.text for b in extract_msg.content if hasattr(b, "text"))
-        clean_extract = raw_extract.replace("```json", "").replace("```", "").strip()
-        extracted = json.loads(clean_extract)
 
-        # Step 2: score the extracted structure
-        score_msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
+        prose_penalty, prose_adjustments = _prose_mechanical_penalties(extracted)
+
+        endpoints = extracted.get("endpoints", [])
+        semantic_input = [
+            {
+                "method": e.get("method", "UNKNOWN"),
+                "path": e.get("path", ""),
+                "description": e.get("description", ""),
+                "params": e.get("parameters", []),
+                "responseDescriptions": {r["status"]: r["description"] for r in e.get("responses", [])},
+            }
+            for e in endpoints[:20]
+        ]
+        semantic = _call_claude(
+            PROSE_SEMANTIC_PROMPT.format(
+                endpoints=json.dumps(semantic_input, indent=2),
+                missing_info=json.dumps(extracted.get("missing_info", [])),
+            ),
             max_tokens=2000,
-            messages=[{"role": "user", "content": PROSE_ANALYSIS_PROMPT.format(
-                extracted=json.dumps(extracted, indent=2),
-                missing_info=json.dumps(extracted.get("missing_info", []))
-            )}]
         )
-        raw_score = "".join(b.text for b in score_msg.content if hasattr(b, "text"))
-        clean_score = raw_score.replace("```json", "").replace("```", "").strip()
-        result = json.loads(clean_score)
 
-        # Attach the extracted structure so the frontend can display source info
-        result["_source"] = {
-            "api_name": extracted.get("api_name"),
-            "base_url": extracted.get("base_url"),
-            "auth_mechanism": extracted.get("auth_mechanism"),
-            "missing_info": extracted.get("missing_info", [])
+        semantic_map = {
+            (e["method"].upper(), e["path"]): e
+            for e in semantic.get("endpoints", [])
+        }
+
+        endpoints_out = []
+        endpoint_totals = []
+
+        for ep in endpoints[:20]:
+            method = ep.get("method", "UNKNOWN").upper()
+            path = ep.get("path", "")
+            sem = semantic_map.get((method, path), {})
+            semantic_score = max(0, min(20, sem.get("semanticScore", 10)))
+
+            prose_base = 40
+            total = min(100, prose_base + semantic_score)
+            endpoint_totals.append(total)
+
+            endpoints_out.append({
+                "method": method,
+                "path": path,
+                "score": total,
+                "smells": sem.get("smells", []),
+                "analysis": sem.get("analysis", ""),
+                "fixes": sem.get("fixes", []),
+            })
+
+        avg = round(sum(endpoint_totals) / len(endpoint_totals)) if endpoint_totals else 50
+        overall = max(0, min(100, avg - prose_penalty))
+        smells_agg = sc.aggregate_smells(endpoints_out)
+
+        result = {
+            "overallScore": overall,
+            "summary": semantic.get("summary", ""),
+            "totalSmells": sum(smells_agg.values()),
+            "smells": smells_agg,
+            "endpoints": endpoints_out,
+            "recommendations": semantic.get("recommendations", []),
+            "scoreBreakdown": {
+                "proseBaseline": 40,
+                "prosePenalties": prose_adjustments,
+                "totalProsePenalty": prose_penalty,
+            },
+            "_source": {
+                "api_name": extracted.get("api_name"),
+                "base_url": extracted.get("base_url"),
+                "auth_mechanism": extracted.get("auth_mechanism"),
+                "missing_info": extracted.get("missing_info", []),
+            },
         }
         return jsonify(result)
     except json.JSONDecodeError as e:
@@ -335,10 +458,9 @@ def ingest_file():
     if ext not in allowed:
         return jsonify({"error": f"Unsupported file type .{ext}. Allowed: {', '.join(sorted(allowed))}"}), 422
 
-    raw_bytes = f.read(5 * 1024 * 1024)  # 5 MB cap
+    raw_bytes = f.read(5 * 1024 * 1024)
 
     if ext == "pdf":
-        # Use Claude's native PDF vision support
         b64 = base64.standard_b64encode(raw_bytes).decode("utf-8")
         try:
             msg = client.messages.create(
@@ -356,13 +478,11 @@ def ingest_file():
                             "text": "Extract all text content from this PDF, preserving the structure as best you can. Return only the extracted text, no commentary."
                         }
                     ]
-                }]
-            )
+                }])
             text = "".join(b.text for b in msg.content if hasattr(b, "text"))
         except Exception as e:
             return jsonify({"error": f"PDF extraction failed: {str(e)}"}), 500
     else:
-        # Plain text variants
         try:
             text = raw_bytes.decode("utf-8", errors="replace")
             if ext in ("html", "htm"):
@@ -395,18 +515,14 @@ def generate_mcp():
     )[:5]
 
     try:
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": MCP_PROMPT.format(
+        result = _call_claude(
+            MCP_PROMPT.format(
                 endpoints=json.dumps(top_endpoints, indent=2),
                 summary=analysis.get("summary", ""),
-                spec=spec[:2000] if spec else "(prose documentation — no formal spec)"
-            )}]
+                spec=spec[:2000] if spec else "(prose documentation - no formal spec)"
+            ),
+            max_tokens=2000,
         )
-        raw = "".join(b.text for b in message.content if hasattr(b, "text"))
-        clean = raw.replace("```json", "").replace("```", "").strip()
-        result = json.loads(clean)
         return jsonify(result)
     except json.JSONDecodeError as e:
         return jsonify({"error": f"Failed to parse MCP output: {str(e)}"}), 500
